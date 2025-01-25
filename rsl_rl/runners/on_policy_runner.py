@@ -16,6 +16,10 @@ from rsl_rl.env import VecEnv
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, EmpiricalNormalization
 from rsl_rl.utils import store_code_state
 
+from torch import nn
+import tqdm
+from torch.autograd import grad
+
 
 class OnPolicyRunner:
     """On-policy runner for training and evaluation."""
@@ -24,6 +28,7 @@ class OnPolicyRunner:
         self.cfg = train_cfg
         self.alg_cfg = train_cfg["algorithm"]
         self.policy_cfg = train_cfg["policy"]
+        self.discriminator_cfg = train_cfg["discriminator"]
         self.device = device
         self.env = env
         obs, extras = self.env.get_observations()
@@ -32,12 +37,66 @@ class OnPolicyRunner:
             num_critic_obs = extras["observations"]["critic"].shape[1]
         else:
             num_critic_obs = num_obs
+        if "amp" in extras["observations"]:
+            num_amp_obs = extras["observations"]["amp"].shape[1]
+        else:
+            num_amp_obs = num_obs
         actor_critic_class = eval(self.policy_cfg.pop("class_name"))  # ActorCritic
         actor_critic: ActorCritic | ActorCriticRecurrent = actor_critic_class(
             num_obs, num_critic_obs, self.env.num_actions, **self.policy_cfg
         ).to(self.device)
+        
+        # hacky way to reused actor_critic_class for discriminator. We only need one network (actor) 
+        ############################
+        discriminator_class = eval(self.discriminator_cfg.pop("class_name"))  # ActorCritic
+        discriminator = discriminator_class(
+            num_amp_obs, # discriminator input
+            1,  # not used
+            1, # discriminator output
+            **self.discriminator_cfg
+        ).actor.to(self.device)
+        ############################
+        
         alg_class = eval(self.alg_cfg.pop("class_name"))  # PPO
-        self.alg: PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg)
+        
+        with open("collected_motions/MixMotion.pk", "rb") as f:
+            import pickle
+            traj = pickle.load(f)
+
+            state_keys = ['q', 'dq']
+
+            # This is to map the order of joint from hardware to the order in the state in simulator
+            robot = env.unwrapped.scene['robot']
+            _joint_ids, _joint_names = robot.find_joints(
+                    ["FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
+                            "FL_hip_joint", "FL_thigh_joint", "FL_calf_joint",
+                            "RR_hip_joint", "RR_thigh_joint", "RR_calf_joint",
+                            "RL_hip_joint", "RL_thigh_joint", "RL_calf_joint"], 
+                    preserve_order=True
+            )
+            _joint_ids = torch.tensor(_joint_ids)
+            _joint_ids_inv = torch.empty_like(_joint_ids)
+            _joint_ids_inv[_joint_ids] = torch.arange(_joint_ids.shape[0])
+
+            history_length = self.env.cfg.observations.amp.history_length
+
+            data_list = []
+            for state_key in state_keys:
+                data = torch.tensor(traj[state_key])
+                data = data[:, _joint_ids_inv]
+                data = data.unfold(0, history_length, 1).transpose(1,2).reshape(-1, history_length * data.size(-1))
+                data_list.append(data)
+                
+            traj = torch.cat(data_list, dim=-1)
+        
+        self.alg: PPO = alg_class(actor_critic, 
+                                  discriminator,
+                                  obs_demo=traj,
+                                  discriminator_l2_reg=self.cfg['discriminator_l2_reg'],
+                                  discriminator_grad_penalty=self.cfg['discriminator_grad_penalty'],
+                                  device=self.device, 
+                                  **self.alg_cfg)
+        
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
         self.empirical_normalization = self.cfg["empirical_normalization"]
@@ -53,6 +112,7 @@ class OnPolicyRunner:
             self.num_steps_per_env,
             [num_obs],
             [num_critic_obs],
+            [num_amp_obs],
             [self.env.num_actions],
         )
 
@@ -92,37 +152,57 @@ class OnPolicyRunner:
             )
         obs, extras = self.env.get_observations()
         critic_obs = extras["observations"].get("critic", obs)
-        obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
+        amp_obs = extras["observations"].get("amp", obs)
+        obs, critic_obs, amp_obs = obs.to(self.device), critic_obs.to(self.device), amp_obs.to(self.device)
         self.train_mode()  # switch to train mode (for dropout for example)
 
         ep_infos = []
         rewbuffer = deque(maxlen=100)
+        task_rewbuffer = deque(maxlen=100)
+        style_rewbuffer = deque(maxlen=100)
+        ep_rewbuffer = deque(maxlen=100)
         lenbuffer = deque(maxlen=100)
-        cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        discriminator_prob_buffer = deque(maxlen=100)
+        cur_ep_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
-
+        
+        w_task = self.cfg['reward_weight_task']
+        w_style = self.cfg['reward_weight_style']
+            
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
         for it in range(start_iter, tot_iter):
+            
             start = time.time()
             # Rollout
+            
             with torch.inference_mode():
                 for i in range(self.num_steps_per_env):
-                    actions = self.alg.act(obs, critic_obs)
-                    obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
+                    actions = self.alg.act(obs, critic_obs, amp_obs)
+                    
+                    obs, task_rewards, dones, infos = self.env.step(actions.to(self.env.device))
+                    style_rewards, prob = self.alg.compute_style_reward()
+                    
                     # move to the right device
-                    obs, critic_obs, rewards, dones = (
+                    obs, critic_obs, amp_obs, task_rewards, dones = (
                         obs.to(self.device),
                         critic_obs.to(self.device),
-                        rewards.to(self.device),
+                        amp_obs.to(self.device),
+                        task_rewards.to(self.device),
                         dones.to(self.device),
                     )
+                    rewards = w_task * task_rewards + w_style * style_rewards
+                    
                     # perform normalization
                     obs = self.obs_normalizer(obs)
                     if "critic" in infos["observations"]:
                         critic_obs = self.critic_obs_normalizer(infos["observations"]["critic"])
                     else:
                         critic_obs = obs
+                    if 'amp' in infos["observations"]:
+                        amp_obs = infos["observations"]["amp"]
+                    else:
+                        amp_obs = obs
                     # process the step
                     self.alg.process_env_step(rewards, dones, infos)
 
@@ -134,12 +214,16 @@ class OnPolicyRunner:
                             ep_infos.append(infos["episode"])
                         elif "log" in infos:
                             ep_infos.append(infos["log"])
-                        cur_reward_sum += rewards
+                        cur_ep_reward_sum += rewards
                         cur_episode_length += 1
                         new_ids = (dones > 0).nonzero(as_tuple=False)
-                        rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                        ep_rewbuffer.extend(cur_ep_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
-                        cur_reward_sum[new_ids] = 0
+                        rewbuffer.extend([rewards.mean().item()])
+                        task_rewbuffer.extend([task_rewards.mean().item()])
+                        style_rewbuffer.extend([style_rewards.mean().item()])
+                        discriminator_prob_buffer.extend([prob.mean().item()])
+                        cur_ep_reward_sum[new_ids] = 0
                         cur_episode_length[new_ids] = 0
 
                 stop = time.time()
@@ -149,7 +233,9 @@ class OnPolicyRunner:
                 start = stop
                 self.alg.compute_returns(critic_obs)
 
+            discriminator_loss = self.alg.update_discriminator()
             mean_value_loss, mean_surrogate_loss = self.alg.update()
+            
             stop = time.time()
             learn_time = stop - start
             self.current_learning_iteration = it
@@ -157,6 +243,7 @@ class OnPolicyRunner:
                 self.log(locals())
             if it % self.save_interval == 0:
                 self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+            self.save_discriminator(os.path.join(self.log_dir, "discriminator_latest.pt"))
             ep_infos.clear()
             if it == start_iter:
                 # obtain all the diff files
@@ -197,6 +284,7 @@ class OnPolicyRunner:
         mean_std = self.alg.actor_critic.std.mean()
         fps = int(self.num_steps_per_env * self.env.num_envs / (locs["collection_time"] + locs["learn_time"]))
 
+        self.writer.add_scalar("Loss/discriminator_loss", locs["discriminator_loss"], locs["it"])
         self.writer.add_scalar("Loss/value_function", locs["mean_value_loss"], locs["it"])
         self.writer.add_scalar("Loss/surrogate", locs["mean_surrogate_loss"], locs["it"])
         self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
@@ -205,8 +293,12 @@ class OnPolicyRunner:
         self.writer.add_scalar("Perf/collection time", locs["collection_time"], locs["it"])
         self.writer.add_scalar("Perf/learning_time", locs["learn_time"], locs["it"])
         if len(locs["rewbuffer"]) > 0:
+            self.writer.add_scalar("Train/mean_ep_reward", statistics.mean(locs["ep_rewbuffer"]), locs["it"])
             self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
+            self.writer.add_scalar("Train/mean_task_reward", statistics.mean(locs["task_rewbuffer"]), locs["it"])
+            self.writer.add_scalar("Train/mean_style_reward", statistics.mean(locs["style_rewbuffer"]), locs["it"])
             self.writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])
+            self.writer.add_scalar("Train/mean_discriminator_prob", statistics.mean(locs["discriminator_prob_buffer"]), locs["it"])
             if self.logger_type != "wandb":  # wandb does not support non-integer x-axis logging
                 self.writer.add_scalar("Train/mean_reward/time", statistics.mean(locs["rewbuffer"]), self.tot_time)
                 self.writer.add_scalar(
@@ -222,10 +314,15 @@ class OnPolicyRunner:
                 f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
                             'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
                 f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
+                f"""{'Discriminator loss:':>{pad}} {locs['discriminator_loss']:.4f}\n"""
                 f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
                 f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
+                f"""{'Mean ep reward:':>{pad}} {statistics.mean(locs['ep_rewbuffer']):.2f}\n"""
                 f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
+                f"""{'Mean task reward:':>{pad}} {statistics.mean(locs['task_rewbuffer']):.2f}\n"""
+                f"""{'Mean style reward:':>{pad}} {statistics.mean(locs['style_rewbuffer']):.2f}\n"""
                 f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
+                f"""{'Mean discriminator prob:':>{pad}} {statistics.mean(locs['discriminator_prob_buffer']):.2f}\n"""
             )
             #   f"""{'Mean reward/step:':>{pad}} {locs['mean_reward']:.2f}\n"""
             #   f"""{'Mean episode length/episode:':>{pad}} {locs['mean_trajectory_length']:.2f}\n""")
@@ -236,6 +333,7 @@ class OnPolicyRunner:
                 f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
                             'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
                 f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
+                f"""{'Discriminator loss:':>{pad}} {locs['discriminator_loss']:.4f}\n"""
                 f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
                 f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
             )
@@ -269,7 +367,18 @@ class OnPolicyRunner:
         if self.logger_type in ["neptune", "wandb"]:
             self.writer.save_model(path, self.current_learning_iteration)
 
-    def load(self, path, load_optimizer=True):
+    def save_discriminator(self, path):
+        saved_dict = {
+            "discriminator_state_dict": self.alg.discriminator.state_dict(),
+            "discriminator_optimizer_state_dict": self.alg.optimizer_discriminator.state_dict(),
+        }
+        torch.save(saved_dict, path)
+        
+        # Upload model to external logging service
+        if self.logger_type in ["neptune", "wandb"]:
+            self.writer.save_model(path, self.current_learning_iteration)
+
+    def load(self, path, load_optimizer=True, itr=None):
         loaded_dict = torch.load(path)
         self.alg.actor_critic.load_state_dict(loaded_dict["model_state_dict"])
         if self.empirical_normalization:
@@ -277,7 +386,10 @@ class OnPolicyRunner:
             self.critic_obs_normalizer.load_state_dict(loaded_dict["critic_obs_norm_state_dict"])
         if load_optimizer:
             self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
-        self.current_learning_iteration = loaded_dict["iter"]
+        if itr is not None:
+            self.current_learning_iteration = itr
+        else:
+            self.current_learning_iteration = loaded_dict["iter"]
         return loaded_dict["infos"]
 
     def get_inference_policy(self, device=None):
