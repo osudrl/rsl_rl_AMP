@@ -58,36 +58,22 @@ class OnPolicyRunner:
         ############################
         
         alg_class = eval(self.alg_cfg.pop("class_name"))  # PPO
-        
-        with open("collected_motions/MixMotion.pk", "rb") as f:
+
+        with open(self.cfg["obs_demo_path"], "rb") as f:
             import pickle
             traj = pickle.load(f)
 
             state_keys = ['q', 'dq']
-
-            # This is to map the order of joint from hardware to the order in the state in simulator
-            robot = env.unwrapped.scene['robot']
-            _joint_ids, _joint_names = robot.find_joints(
-                    ["FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
-                            "FL_hip_joint", "FL_thigh_joint", "FL_calf_joint",
-                            "RR_hip_joint", "RR_thigh_joint", "RR_calf_joint",
-                            "RL_hip_joint", "RL_thigh_joint", "RL_calf_joint"], 
-                    preserve_order=True
-            )
-            _joint_ids = torch.tensor(_joint_ids)
-            _joint_ids_inv = torch.empty_like(_joint_ids)
-            _joint_ids_inv[_joint_ids] = torch.arange(_joint_ids.shape[0])
 
             history_length = self.env.cfg.observations.amp.history_length
 
             data_list = []
             for state_key in state_keys:
                 data = torch.tensor(traj[state_key])
-                data = data[:, _joint_ids_inv]
                 data = data.unfold(0, history_length, 1).transpose(1,2).reshape(-1, history_length * data.size(-1))
                 data_list.append(data)
                 
-            traj = torch.cat(data_list, dim=-1)
+            traj = torch.cat(data_list, dim=-1)           
         
         self.alg: PPO = alg_class(actor_critic, 
                                   discriminator,
@@ -179,9 +165,14 @@ class OnPolicyRunner:
             with torch.inference_mode():
                 for i in range(self.num_steps_per_env):
                     actions = self.alg.act(obs, critic_obs, amp_obs)
-                    
+
                     obs, task_rewards, dones, infos = self.env.step(actions.to(self.env.device))
-                    style_rewards, prob = self.alg.compute_style_reward()
+
+                    if w_style > 0:
+                        style_rewards, prob = self.alg.compute_style_reward()
+                    else:
+                        style_rewards = torch.zeros_like(task_rewards)
+                        prob = torch.zeros_like(task_rewards)
                     
                     # move to the right device
                     obs, critic_obs, amp_obs, task_rewards, dones = (
@@ -232,8 +223,12 @@ class OnPolicyRunner:
                 # Learning step
                 start = stop
                 self.alg.compute_returns(critic_obs)
-
-            discriminator_loss = self.alg.update_discriminator()
+            
+            # No discriminator update if w_style = 0
+            if w_style > 0:
+                discriminator_loss = self.alg.update_discriminator()
+            else:
+                discriminator_loss = 0.0
             mean_value_loss, mean_surrogate_loss = self.alg.update()
             
             stop = time.time()
