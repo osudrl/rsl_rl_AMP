@@ -14,7 +14,6 @@ class RolloutStorage:
         def __init__(self):
             self.observations = None
             self.critic_observations = None
-            self.amp_observations = None
             self.actions = None
             self.rewards = None
             self.dones = None
@@ -27,12 +26,11 @@ class RolloutStorage:
         def clear(self):
             self.__init__()
 
-    def __init__(self, num_envs, num_transitions_per_env, obs_shape, privileged_obs_shape, amp_obs_shape, actions_shape, device="cpu"):
+    def __init__(self, num_envs, num_transitions_per_env, obs_shape, privileged_obs_shape, actions_shape, device="cpu"):
         self.device = device
 
         self.obs_shape = obs_shape
         self.privileged_obs_shape = privileged_obs_shape
-        self.amp_obs_shape = amp_obs_shape
         self.actions_shape = actions_shape
 
         # Core
@@ -43,10 +41,6 @@ class RolloutStorage:
             )
         else:
             self.privileged_observations = None
-        if amp_obs_shape[0] is not None:
-            self.amp_observations = torch.zeros(num_transitions_per_env, num_envs, *amp_obs_shape, device=self.device)
-        else:
-            self.amp_observations = None
         self.rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
@@ -74,8 +68,6 @@ class RolloutStorage:
         self.observations[self.step].copy_(transition.observations)
         if self.privileged_observations is not None:
             self.privileged_observations[self.step].copy_(transition.critic_observations)
-        if self.amp_observations is not None:
-            self.amp_observations[self.step].copy_(transition.amp_observations)
         self.actions[self.step].copy_(transition.actions)
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
@@ -145,10 +137,7 @@ class RolloutStorage:
             critic_observations = self.privileged_observations.flatten(0, 1)
         else:
             critic_observations = observations
-        if self.amp_observations is not None:
-            amp_observations = self.amp_observations.flatten(0, 1)
-        else:
-            amp_observations = observations
+
         actions = self.actions.flatten(0, 1)
         values = self.values.flatten(0, 1)
         returns = self.returns.flatten(0, 1)
@@ -165,7 +154,6 @@ class RolloutStorage:
 
                 obs_batch = observations[batch_idx]
                 critic_observations_batch = critic_observations[batch_idx]
-                amp_observations_batch = amp_observations[batch_idx]
                 actions_batch = actions[batch_idx]
                 target_values_batch = values[batch_idx]
                 returns_batch = returns[batch_idx]
@@ -173,7 +161,7 @@ class RolloutStorage:
                 advantages_batch = advantages[batch_idx]
                 old_mu_batch = old_mu[batch_idx]
                 old_sigma_batch = old_sigma[batch_idx]
-                yield obs_batch, critic_observations_batch, amp_observations_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
+                yield obs_batch, critic_observations_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
                     None,
                     None,
                 ), None
@@ -185,11 +173,6 @@ class RolloutStorage:
             padded_critic_obs_trajectories, _ = split_and_pad_trajectories(self.privileged_observations, self.dones)
         else:
             padded_critic_obs_trajectories = padded_obs_trajectories
-            
-        if self.amp_observations is not None:
-            padded_amp_obs_trajectories, _ = split_and_pad_trajectories(self.amp_observations, self.dones)
-        else:
-            padded_amp_obs_trajectories = padded_obs_trajectories
 
         mini_batch_size = self.num_envs // num_mini_batches
         for ep in range(num_epochs):
@@ -208,7 +191,6 @@ class RolloutStorage:
                 masks_batch = trajectory_masks[:, first_traj:last_traj]
                 obs_batch = padded_obs_trajectories[:, first_traj:last_traj]
                 critic_obs_batch = padded_critic_obs_trajectories[:, first_traj:last_traj]
-                amp_obs_batch = padded_amp_obs_trajectories[:, first_traj:last_traj]
 
                 actions_batch = self.actions[:, start:stop]
                 old_mu_batch = self.mu[:, start:stop]
@@ -238,7 +220,7 @@ class RolloutStorage:
                 hid_a_batch = hid_a_batch[0] if len(hid_a_batch) == 1 else hid_a_batch
                 hid_c_batch = hid_c_batch[0] if len(hid_c_batch) == 1 else hid_c_batch
 
-                yield obs_batch, critic_obs_batch, amp_obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
+                yield obs_batch, critic_obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
                     hid_a_batch,
                     hid_c_batch,
                 ), masks_batch

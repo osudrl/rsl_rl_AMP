@@ -6,7 +6,6 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
 
 from rsl_rl.modules import ActorCritic
 from rsl_rl.storage import RolloutStorage
@@ -18,10 +17,6 @@ class PPO:
     def __init__(
         self,
         actor_critic,
-        discriminator,
-        obs_demo=None,
-        discriminator_l2_reg = 0.01,
-        discriminator_grad_penalty = 5.0,
         num_learning_epochs=1,
         num_mini_batches=1,
         clip_param=0.2,
@@ -45,14 +40,8 @@ class PPO:
         # PPO components
         self.actor_critic = actor_critic
         self.actor_critic.to(self.device)
-        self.discriminator = discriminator
-        self.discriminator.to(self.device)
-        self.obs_demo = obs_demo
-        self.discriminator_l2_reg = discriminator_l2_reg
-        self.discriminator_grad_penalty = discriminator_grad_penalty
         self.storage = None  # initialized later
         self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=learning_rate)
-        self.optimizer_discriminator = optim.Adam(self.discriminator.parameters(), lr=learning_rate)
         self.transition = RolloutStorage.Transition()
 
         # PPO parameters
@@ -66,9 +55,9 @@ class PPO:
         self.max_grad_norm = max_grad_norm
         self.use_clipped_value_loss = use_clipped_value_loss
 
-    def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, amp_obs_shape, action_shape):
+    def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape):
         self.storage = RolloutStorage(
-            num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, amp_obs_shape, action_shape, self.device
+            num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape, self.device
         )
 
     def test_mode(self):
@@ -77,7 +66,7 @@ class PPO:
     def train_mode(self):
         self.actor_critic.train()
 
-    def act(self, obs, critic_obs, amp_obs):
+    def act(self, obs, critic_obs):
         if self.actor_critic.is_recurrent:
             self.transition.hidden_states = self.actor_critic.get_hidden_states()
         # Compute the actions and values
@@ -89,19 +78,7 @@ class PPO:
         # need to record obs and critic_obs before env.step()
         self.transition.observations = obs
         self.transition.critic_observations = critic_obs
-        self.transition.amp_observations = amp_obs
         return self.transition.actions
-    
-    def compute_style_reward(self) -> torch.Tensor:
-        with torch.no_grad():
-            self.discriminator.eval()
-            disc_logits = self.discriminator(self.transition.amp_observations)
-            # prob = 1 / (1 + torch.exp(-disc_logits)) 
-            prob = torch.sigmoid(disc_logits)
-            disc_r = -torch.log(torch.maximum(1 - prob, torch.tensor(0.0001, device=self.device)))
-            _disc_reward_scale = 2.0
-            disc_r *= _disc_reward_scale
-            return disc_r.squeeze(-1), prob.squeeze(-1)
 
     def process_env_step(self, rewards, dones, infos):
         self.transition.rewards = rewards.clone()
@@ -120,72 +97,6 @@ class PPO:
     def compute_returns(self, last_critic_obs):
         last_values = self.actor_critic.evaluate(last_critic_obs).detach()
         self.storage.compute_returns(last_values, self.gamma, self.lam)
-        
-    def _disc_loss_neg(self, disc_logits):
-        bce = torch.nn.BCEWithLogitsLoss()
-        loss = bce(disc_logits, torch.zeros_like(disc_logits))
-        return loss
-
-    def _disc_loss_pos(self, disc_logits):
-        bce = torch.nn.BCEWithLogitsLoss()
-        loss = bce(disc_logits, torch.ones_like(disc_logits))
-        return loss
-        
-    def update_discriminator(self):
-        self.discriminator.train()
-        
-        value_losses = []
-        if self.actor_critic.is_recurrent:
-            generator = self.storage.reccurent_mini_batch_generator(num_mini_batches=1, num_epochs=self.num_learning_epochs)
-        else:
-            generator = self.storage.mini_batch_generator(num_mini_batches=1, num_epochs=self.num_learning_epochs)
-        for (
-            obs_batch,
-            critic_obs_batch,
-            amp_obs_batch,
-            actions_batch,
-            target_values_batch,
-            advantages_batch,
-            returns_batch,
-            old_actions_log_prob_batch,
-            old_mu_batch,
-            old_sigma_batch,
-            hid_states_batch,
-            masks_batch,
-        ) in generator:
-            idx = torch.randint(0, self.obs_demo.size(0), (obs_batch.size(0),))
-            
-            obs_demo = torch.autograd.Variable(self.obs_demo[idx], requires_grad=True).to(self.device)
-            
-            disc_demo_logit = self.discriminator(obs_demo)
-            disc_agent_logit = self.discriminator(amp_obs_batch)
-            
-            # Classic Discriminator Loss
-            disc_loss_demo = self._disc_loss_pos(disc_demo_logit)
-            disc_loss_agent = self._disc_loss_neg(disc_agent_logit)
-            disc_loss_p1 = 0.5 * (disc_loss_agent + disc_loss_demo)
-            
-            # Discriminator weight regularization
-            disc_logit_layer_weight = self.discriminator[0].weight # weight of the first layer. 
-            disc_logit_reg_loss = torch.sum(torch.square(disc_logit_layer_weight)) # L2 regularization
-            
-            # gradient penalty 
-            disc_demo_grad = torch.autograd.grad(disc_demo_logit, obs_demo, grad_outputs=torch.ones_like(disc_demo_logit),
-                                                create_graph = True, retain_graph = True, only_inputs = True)[0]
-            disc_demo_grad = torch.sum(torch.square(disc_demo_grad), dim=-1)
-            disc_grad_penalty = torch.mean(disc_demo_grad)
-                    
-            # disc_loss = disc_loss_p1 + 0.01 * disc_logit_reg_loss + 5 * disc_grad_penalty
-            # disc_loss = disc_loss_p1 + 0.0 * disc_logit_reg_loss + 0.0 * disc_grad_penalty
-            disc_loss = disc_loss_p1 + self.discriminator_l2_reg * disc_logit_reg_loss + self.discriminator_grad_penalty * disc_grad_penalty
-            self.optimizer_discriminator.zero_grad()
-            disc_loss.backward()
-            self.optimizer_discriminator.step()
-            
-            value_losses.append(disc_loss.item())
-            
-        return np.mean(value_losses)
-
 
     def update(self):
         mean_value_loss = 0
@@ -197,7 +108,6 @@ class PPO:
         for (
             obs_batch,
             critic_obs_batch,
-            amp_obs_batch,
             actions_batch,
             target_values_batch,
             advantages_batch,
