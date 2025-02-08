@@ -148,9 +148,6 @@ class OnPolicyAmpRunner:
         discriminator_prob_buffer = deque(maxlen=100)
         cur_ep_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
-        
-        w_task = self.cfg['reward_weight_task']
-        w_style = self.cfg['reward_weight_style']
 
         style_reward_term = self.env.unwrapped.reward_manager.cfg.style_reward
             
